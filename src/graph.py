@@ -180,22 +180,33 @@ class Neo4jGraph:
         rels = self.run("MATCH ()-[r]->() RETURN count(r) AS n")[0]["n"]
         return {"nodes": nodes, "relationships": rels}
 
+    GENERIC_NAMES = [
+        "ma túy", "chất ma túy", "ma túy tổng hợp", "ma túy đá",
+        "tiền chất", "chất gây nghiện", "chất hướng thần",
+    ]
+
     def seed_facts(self, question: str, doc_ids: list[str], skip_labels: tuple[str, ...] = (),
                    limit: int = 60) -> tuple[list[str], list[str]]:
         """Ontology-independent first step: seed nodes + their 1-hop edges as text facts.
 
         Seeds = nodes whose `doc_id` is in doc_ids, or whose `name`/`aliases` appear in the question.
+        Generic drug terms like 'ma túy' are excluded from question substring matching to avoid expanding the whole graph.
         Returns (seed elementIds, facts). Nodes with a label in skip_labels are left out of the facts.
         """
         seeds = self.run(
             """
             MATCH (n)
             WHERE n.doc_id IN $doc_ids
-               OR (n.name IS :: STRING AND size(n.name) >= 3 AND toLower($q) CONTAINS toLower(n.name))
-               OR any(a IN coalesce(n.aliases, []) WHERE size(a) >= 3 AND toLower($q) CONTAINS toLower(a))
+               OR (
+                   n.name IS :: STRING
+                   AND size(n.name) >= 3
+                   AND NOT toLower(n.name) IN $generic_names
+                   AND toLower($q) CONTAINS toLower(n.name)
+               )
+               OR any(a IN coalesce(n.aliases, []) WHERE size(a) >= 3 AND NOT toLower(a) IN $generic_names AND toLower($q) CONTAINS toLower(a))
             RETURN elementId(n) AS id
             """,
-            q=question, doc_ids=doc_ids,
+            q=question, doc_ids=doc_ids, generic_names=self.GENERIC_NAMES,
         )
         seed_ids = [row["id"] for row in seeds]
         edges = self.run(
@@ -264,96 +275,198 @@ class Neo4jGraph:
     # ---------------------------------------------------------------- KG-3
 
     def context(self, question: str, doc_ids: list[str], max_facts: int = 60) -> list[str]:
-        """Graph facts for a question: seeds + 1 hop, then the legal basis of every case reached."""
-        seed_ids, seed_fact_list = self.seed_facts(question, doc_ids, limit=30)
-        facts: list[str] = []
-        seen: set[str] = set()
+        """Graph facts for a question: prioritized legal clauses, person sentences, cases, and seeds."""
+        if max_facts <= 0:
+            return []
 
-        def add_fact(f: str) -> None:
-            if f and f not in seen and len(facts) < max_facts:
+        bucket_aggregation: list[str] = []
+        bucket_clauses: list[str] = []
+        bucket_person_case: list[str] = []
+        bucket_cases: list[str] = []
+        bucket_seeds: list[str] = []
+
+        is_max_asked = bool(re.search(r"tối đa|cao nhất|khung cao", question, re.IGNORECASE))
+        is_aggregation = bool(re.search(r"những vụ|các vụ|vụ việc nào|vụ án nào|danh sách vụ", question, re.IGNORECASE))
+        q_substances = find_substances(question)
+
+        # 1. Aggregation queries: retrieve specific cases connected via Case-[:INVOLVES]->Substance
+        if is_aggregation and q_substances:
+            rows = self.run(
+                """
+                MATCH (k:Case)-[r:INVOLVES]->(s:Substance)
+                WHERE toLower(s.name) IN [sub IN $substances | toLower(sub)]
+                OPTIONAL MATCH (p:Person)-[pin:INVOLVED_IN]->(k)
+                WITH k, r, s, collect(DISTINCT p.name + CASE WHEN pin.role IS NOT NULL AND pin.role <> '' THEN ' (' + pin.role + ')' ELSE '' END) AS people
+                RETURN k.name AS name, k.summary AS summary, k.doc_id AS doc_id, r.amount AS amount, s.name AS substance, people
+                ORDER BY k.doc_id, k.name
+                """,
+                substances=q_substances,
+            )
+            for r in rows:
+                p_str = f" [Người liên quan: {', '.join(r['people'])}]" if r["people"] else ""
+                amt_str = f", khối lượng: {r['amount']}" if r["amount"] else ""
+                bucket_aggregation.append(
+                    f"Vụ việc '{r['name']}' (doc_id: {r['doc_id']}): {r['summary']} [Chất: {r['substance']}{amt_str}]{p_str}"
+                )
+
+        # 2. Seed facts: 1-hop expansion from seed nodes
+        seed_ids, seed_fact_list = self.seed_facts(question, doc_ids, limit=30)
+        for sf in seed_fact_list:
+            if "INVOLVED_IN" in sf and ("sentence" in sf or "charge" in sf):
+                # Prioritize target person mentioned in question
+                if any(w in question for w in re.findall(r"Person:\s*([^)]+)", sf)):
+                    bucket_person_case.insert(0, sf)
+                else:
+                    bucket_person_case.append(sf)
+            else:
+                bucket_seeds.append(sf)
+
+        # 3. Cases that are a seed or next to one (skip if aggregation already captured them)
+        if not is_aggregation:
+            case_rows = self.run(
+                """
+                MATCH (k:Case)
+                WHERE elementId(k) IN $ids OR EXISTS { MATCH (s)--(k) WHERE elementId(s) IN $ids }
+                RETURN DISTINCT elementId(k) AS id, k.name AS name, k.summary AS summary
+                """,
+                ids=seed_ids,
+            )
+            case_ids = [row["id"] for row in case_rows]
+            for row in case_rows:
+                name, summary = row.get("name"), row.get("summary")
+                if name and summary:
+                    bucket_cases.append(f"Vụ việc '{name}': {summary}")
+
+            # 4. For reached cases, follow:
+            # (Case)-[:CHARGED_WITH]->(Crime)<-[:DEFINES]-(Article)-[:HAS_CLAUSE]->(Clause)
+            if case_ids:
+                clause_rows = self.run(
+                    """
+                    MATCH (k:Case)-[:CHARGED_WITH]->(:Crime)<-[:DEFINES]-(a:Article)-[:HAS_CLAUSE]->(cl:Clause)
+                    WHERE elementId(k) IN $case_ids
+                      AND (
+                        cl.number = 1
+                        OR EXISTS { MATCH (k)-[:INVOLVES]->(sub:Substance)<-[:MENTIONS]-(cl) }
+                        OR ($is_max = true AND (
+                            cl.text CONTAINS 'tử hình'
+                            OR cl.text CONTAINS 'chung thân'
+                            OR ((cl.penalty CONTAINS 'tù' OR cl.penalty CONTAINS 'tử hình' OR cl.penalty CONTAINS 'chung thân')
+                                AND NOT EXISTS {
+                                    MATCH (a)-[:HAS_CLAUSE]->(cl2:Clause)
+                                    WHERE (cl2.penalty CONTAINS 'tù' OR cl2.penalty CONTAINS 'tử hình' OR cl2.penalty CONTAINS 'chung thân')
+                                      AND cl2.number > cl.number
+                                })
+                        ))
+                      )
+                    RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text
+                    ORDER BY a.id, cl.number
+                    """,
+                    case_ids=case_ids,
+                    is_max=is_max_asked,
+                )
+                for row in clause_rows:
+                    bucket_clauses.append(f"[{row['article_id']} - {row['title']}] khoản {row['number']}: {row['text']}")
+
+        # 5. Direct articles from question or doc_ids (supports both BLHS and Luật PCMT)
+        target_law = None
+        ql = question.lower()
+        if "pcmt" in ql or "phòng, chống ma túy" in ql or "phòng chống ma túy" in ql:
+            target_law = "Luật PCMT"
+        elif "blhs" in ql or "hình sự" in ql or "bộ luật hình sự" in ql:
+            target_law = "BLHS"
+
+        article_matches = re.findall(r"[Đđ]iều\s*(\d+)", question)
+        law_doc_ids = [d for d in doc_ids if d.startswith("pcmt-") or d.startswith("blhs-")]
+
+        matched_articles = []
+        if article_matches:
+            for num in article_matches:
+                arts = self.run(
+                    """
+                    MATCH (a:Article)
+                    WHERE a.id CONTAINS ('Điều ' + $num + ' ') OR a.id = ('Điều ' + $num)
+                       OR a.id CONTAINS ('Điều ' + $num + '.')
+                    RETURN a.id AS id, a.title AS title, a.law AS law, a.doc_id AS doc_id
+                    """,
+                    num=num,
+                )
+                for a in arts:
+                    if target_law and a["law"] != target_law and target_law not in a["id"]:
+                        continue
+                    matched_articles.append(a)
+        elif law_doc_ids:
+            arts = self.run(
+                """
+                MATCH (a:Article)
+                WHERE a.doc_id IN $law_docs
+                RETURN a.id AS id, a.title AS title, a.law AS law, a.doc_id AS doc_id
+                """,
+                law_docs=law_doc_ids,
+            )
+            matched_articles.extend(arts)
+
+        pcmt_keywords = [
+            w for w in [
+                "tiền chất", "chất ma túy", "chất gây nghiện", "chất hướng thần",
+                "cây có chứa chất ma túy", "phòng, chống ma túy", "tệ nạn ma túy", "cai nghiện",
+            ] if w in ql
+        ]
+
+        for art in matched_articles:
+            art_id = art["id"]
+            is_pcmt = art.get("law") == "Luật PCMT" or "PCMT" in art_id
+            if is_pcmt:
+                clauses = self.run(
+                    """
+                    MATCH (a:Article {id: $art_id})-[:HAS_CLAUSE]->(cl:Clause)
+                    WHERE cl.number = 1
+                       OR any(k IN $keywords WHERE toLower(cl.text) CONTAINS k)
+                    RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text
+                    ORDER BY cl.number
+                    """,
+                    art_id=art_id,
+                    keywords=pcmt_keywords,
+                )
+            else:
+                clauses = self.run(
+                    """
+                    MATCH (a:Article {id: $art_id})-[:HAS_CLAUSE]->(cl:Clause)
+                    WHERE cl.number = 1
+                       OR any(s IN $substances WHERE EXISTS { MATCH (cl)-[:MENTIONS]->(:Substance {name: s}) })
+                       OR ($is_max = true AND (
+                           cl.text CONTAINS 'tử hình'
+                           OR cl.text CONTAINS 'chung thân'
+                           OR ((cl.penalty CONTAINS 'tù' OR cl.penalty CONTAINS 'tử hình' OR cl.penalty CONTAINS 'chung thân')
+                               AND NOT EXISTS {
+                                   MATCH (a)-[:HAS_CLAUSE]->(cl2:Clause)
+                                   WHERE (cl2.penalty CONTAINS 'tù' OR cl2.penalty CONTAINS 'tử hình' OR cl2.penalty CONTAINS 'chung thân')
+                                     AND cl2.number > cl.number
+                               })
+                       ))
+                    RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text
+                    ORDER BY cl.number
+                    """,
+                    art_id=art_id,
+                    substances=q_substances,
+                    is_max=is_max_asked,
+                )
+            for row in clauses:
+                bucket_clauses.append(f"[{row['article_id']} - {row['title']}] khoản {row['number']}: {row['text']}")
+
+        # 6. Priority ordering
+        if is_aggregation:
+            all_ordered = bucket_aggregation + bucket_clauses + bucket_person_case + bucket_cases + bucket_seeds
+        else:
+            all_ordered = bucket_clauses + bucket_person_case + bucket_cases + bucket_seeds
+
+        seen: set[str] = set()
+        facts: list[str] = []
+        for f in all_ordered:
+            if f and f not in seen:
                 seen.add(f)
                 facts.append(f)
 
-        for sf in seed_fact_list:
-            add_fact(sf)
-
-        # 1. Cases that are a seed or next to one
-        case_rows = self.run(
-            """
-            MATCH (k:Case)
-            WHERE elementId(k) IN $ids OR EXISTS { MATCH (s)--(k) WHERE elementId(s) IN $ids }
-            RETURN DISTINCT elementId(k) AS id, k.name AS name, k.summary AS summary
-            """,
-            ids=seed_ids,
-        )
-        case_ids = [row["id"] for row in case_rows]
-        for row in case_rows:
-            name, summary = row.get("name"), row.get("summary")
-            if name and summary:
-                add_fact(f"Vụ việc '{name}': {summary}")
-
-        # 2. For reached cases, follow:
-        # (Case)-[:CHARGED_WITH]->(Crime)<-[:DEFINES]-(Article)-[:HAS_CLAUSE]->(Clause)
-        is_max_asked = bool(re.search(r"tối đa|cao nhất|khung cao", question, re.IGNORECASE))
-        if case_ids:
-            clause_rows = self.run(
-                """
-                MATCH (k:Case)-[:CHARGED_WITH]->(:Crime)<-[:DEFINES]-(a:Article)-[:HAS_CLAUSE]->(cl:Clause)
-                WHERE elementId(k) IN $case_ids
-                  AND (
-                    cl.number = 1
-                    OR EXISTS { MATCH (k)-[:INVOLVES]->(sub:Substance)<-[:MENTIONS]-(cl) }
-                    OR ($is_max = true AND (
-                        cl.text CONTAINS 'tử hình'
-                        OR cl.text CONTAINS 'chung thân'
-                        OR ((cl.penalty CONTAINS 'tù' OR cl.penalty CONTAINS 'tử hình' OR cl.penalty CONTAINS 'chung thân')
-                            AND NOT EXISTS {
-                                MATCH (a)-[:HAS_CLAUSE]->(cl2:Clause)
-                                WHERE (cl2.penalty CONTAINS 'tù' OR cl2.penalty CONTAINS 'tử hình' OR cl2.penalty CONTAINS 'chung thân')
-                                  AND cl2.number > cl.number
-                            })
-                    ))
-                  )
-                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text
-                ORDER BY a.id, cl.number
-                """,
-                case_ids=case_ids,
-                is_max=is_max_asked,
-            )
-            for row in clause_rows:
-                add_fact(f"[{row['article_id']} - {row['title']}] khoản {row['number']}: {row['text']}")
-
-        # 3. Direct articles named in question ("Điều 251" -> Điều 251 BLHS)
-        article_matches = re.findall(r"[Đđ]iều\s*(\d+)", question)
-        q_substances = find_substances(question)
-        for num in article_matches:
-            art_id = f"Điều {num} BLHS"
-            art_clauses = self.run(
-                """
-                MATCH (a:Article {id: $art_id})-[:HAS_CLAUSE]->(cl:Clause)
-                WHERE cl.number = 1
-                   OR any(s IN $substances WHERE EXISTS { MATCH (cl)-[:MENTIONS]->(:Substance {name: s}) })
-                   OR ($is_max = true AND (
-                       cl.text CONTAINS 'tử hình'
-                       OR cl.text CONTAINS 'chung thân'
-                       OR ((cl.penalty CONTAINS 'tù' OR cl.penalty CONTAINS 'tử hình' OR cl.penalty CONTAINS 'chung thân')
-                           AND NOT EXISTS {
-                               MATCH (a)-[:HAS_CLAUSE]->(cl2:Clause)
-                               WHERE (cl2.penalty CONTAINS 'tù' OR cl2.penalty CONTAINS 'tử hình' OR cl2.penalty CONTAINS 'chung thân')
-                                 AND cl2.number > cl.number
-                           })
-                   ))
-                RETURN DISTINCT a.id AS article_id, a.title AS title, cl.number AS number, cl.text AS text
-                ORDER BY cl.number
-                """,
-                art_id=art_id,
-                substances=q_substances,
-                is_max=is_max_asked,
-            )
-            for row in art_clauses:
-                add_fact(f"[{row['article_id']} - {row['title']}] khoản {row['number']}: {row['text']}")
-
-        return facts
+        return facts[:max_facts]
 
 # ---------------------------------------------------------------------------------------------- KG-2
 
